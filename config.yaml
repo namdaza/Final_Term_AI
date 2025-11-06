@@ -1,0 +1,20 @@
+dataset:
+  train_dir: ./data/train
+  val_dir: ./data/val
+  num_classes: 10
+  input_size: 224
+  batch_size: 32
+  num_workers: 2
+
+train:
+  epochs: 30
+  lr: 0.0003
+  optimizer: Adam
+  loss_fn: CrossEntropyLoss
+  early_stopping_patience: 5
+
+augmentations:
+  rotation: 15
+  flip: true
+  brightness: true
+  normalize: true

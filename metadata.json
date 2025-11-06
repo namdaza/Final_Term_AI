@@ -1,0 +1,52 @@
+{
+  "egg_tart": {
+    "display_name": "Egg Tart",
+    "creative_label": "Mặt trời nhỏ trong tách trà ☀️",
+    "price": 21000
+  },
+  "croissant": {
+    "display_name": "Croissant",
+    "creative_label": "Xoắn ốc suy nghĩ 🌀",
+    "price": 30000
+  },
+  "cookies_dua": {
+    "display_name": "Cookies Dừa",
+    "creative_label": "Mảnh dừa giòn tan – cảm xúc tan chảy 🥥",
+    "price": 23000
+  },
+  "cha_bong_cay": {
+    "display_name": "Chà Bông Cây",
+    "creative_label": "Chiếc gậy phủ tuyết chà bông ❄️",
+    "price": 27000
+  },
+  "patechaud": {
+    "display_name": "Patechaud",
+    "creative_label": "Lớp bánh Pháp lạnh lùng mà ngọt ngào 🇫🇷",
+    "price": 30000
+  },
+  "banh_mi_dua_luoi": {
+    "display_name": "Bánh Mì Dừa Lưới",
+    "creative_label": "Túi ấm nhỏ dành cho tâm hồn 🧺",
+    "price": 15000
+  },
+  "banh_da_lon": {
+    "display_name": "Bánh Da Lợn",
+    "creative_label": "Layer trong layer – cuộc đời nhiều lớp 🌀",
+    "price": 23000
+  },
+  "banh_mi_bo_cua_lon": {
+    "display_name": "Bánh Mì Bơ (Cua Lớn)",
+    "creative_label": "Cua khổng lồ siêu đáng yêu 🦀",
+    "price": 18000
+  },
+  "muffin_viet_quat": {
+    "display_name": "Muffin Việt Quất",
+    "creative_label": "Trái tim màu tím 💜",
+    "price": 25000
+  },
+  "banh_chuoi_nuong": {
+    "display_name": "Bánh Chuối Nướng",
+    "creative_label": "Thơm như tuổi thơ 🍌",
+    "price": 19000
+  }
+}
