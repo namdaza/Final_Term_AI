@@ -1,227 +1,191 @@
 import os
+import cv2
+import numpy as np
 import json
-import yaml
-import time
-from typing import Dict, Any, Tuple, List
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
-
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-CONFIG_PATH = "config.yaml"
-MODEL_DIR = "model"
-LOGS_DIR = "logs"
-METADATA_PATH = "metadata.json"
+# ============================
+# CONFIG
+# ============================
 
-def ensure_dirs():
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(LOGS_DIR, exist_ok=True)
+DATASET_RAW = "dataset_raw"      # chứa ảnh chưa segmentation
+DATASET_SEG = "dataset_segmented"  # chứa ảnh sau segmentation
+MODEL_PATH = "model/model.h5"
+CLASS_MAP_PATH = "model/class_map.json"
 
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+IMG_SIZE = 128
+BATCH_SIZE = 16
+EPOCHS = 20
 
-def build_transforms(cfg: Dict[str, Any]) -> Tuple[transforms.Compose, transforms.Compose]:
-    size = cfg["dataset"]["input_size"]
-    aug = cfg.get("augmentations", {})
-    train_tfms = [transforms.Resize((size, size))]
-    if aug.get("rotation", 0):
-        train_tfms.append(transforms.RandomRotation(aug["rotation"]))
-    if aug.get("flip", True):
-        train_tfms.append(transforms.RandomHorizontalFlip())
-    if aug.get("brightness", True):
-        train_tfms.append(transforms.ColorJitter(brightness=0.2, contrast=0.2))
-    train_tfms += [
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ]
 
-    val_tfms = transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+# ============================
+# 1. SEGMENTATION BẰNG OPENCV
+# ============================
+
+def segment_image(image_path):
+    img = cv2.imread(image_path)
+
+    if img is None:
+        return None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Threshold tách vật thể
+    _, th = cv2.threshold(blur, 0, 255,
+                          cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Morphology
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    # Find contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) == 0:
+        return None
+
+    # Chọn contour lớn nhất → món bánh chính
+    c = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+
+    crop = img[y:y+h, x:x+w]
+    return crop
+
+
+def build_segmented_dataset():
+    print("🔧 Creating segmented dataset...")
+
+    if not os.path.exists(DATASET_SEG):
+        os.makedirs(DATASET_SEG)
+
+    for class_name in os.listdir(DATASET_RAW):
+        class_dir_raw = os.path.join(DATASET_RAW, class_name)
+        class_dir_seg = os.path.join(DATASET_SEG, class_name)
+        os.makedirs(class_dir_seg, exist_ok=True)
+
+        for file in os.listdir(class_dir_raw):
+            path = os.path.join(class_dir_raw, file)
+
+            try:
+                cropped = segment_image(path)
+                if cropped is None:
+                    continue
+
+                cropped = cv2.resize(cropped, (IMG_SIZE, IMG_SIZE))
+                cv2.imwrite(os.path.join(class_dir_seg, file), cropped)
+            except:
+                continue
+
+    print("✅ Segmentation done.")
+
+
+# ============================
+# 2. CNN MODEL (TRAIN TỪ ĐẦU)
+# ============================
+
+def build_cnn(num_classes):
+    model = models.Sequential([
+        layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
+
+        layers.Conv2D(32, (3, 3), activation='relu', padding="same"),
+        layers.MaxPooling2D(),
+
+        layers.Conv2D(64, (3, 3), activation='relu', padding="same"),
+        layers.MaxPooling2D(),
+
+        layers.Conv2D(128, (3, 3), activation='relu', padding="same"),
+        layers.MaxPooling2D(),
+
+        layers.Flatten(),
+        layers.Dense(256, activation='relu'),
+        layers.Dropout(0.3),
+
+        layers.Dense(num_classes, activation="softmax")
     ])
 
-    return transforms.Compose(train_tfms), val_tfms
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
 
-def create_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
-    train_dir = cfg["dataset"]["train_dir"]
-    val_dir = cfg["dataset"]["val_dir"]
-    batch_size = cfg["dataset"]["batch_size"]
-    num_workers = cfg["dataset"]["num_workers"]
-
-    train_tfms, val_tfms = build_transforms(cfg)
-
-    train_ds = datasets.ImageFolder(train_dir, transform=train_tfms)
-    val_ds = datasets.ImageFolder(val_dir, transform=val_tfms)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    return train_loader, val_loader, train_ds.class_to_idx
-
-def build_model(num_classes: int) -> nn.Module:
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
     return model
 
-class EarlyStopping:
-    def __init__(self, patience: int = 5, mode: str = "max"):
-        self.patience = patience
-        self.mode = mode
-        self.best = None
-        self.num_bad = 0
-        self.should_stop = False
 
-    def step(self, metric: float):
-        if self.best is None:
-            self.best = metric
-            return
-        improve = (metric > self.best) if self.mode == "max" else (metric < self.best)
-        if improve:
-            self.best = metric
-            self.num_bad = 0
-        else:
-            self.num_bad += 1
-            if self.num_bad >= self.patience:
-                self.should_stop = True
+# ============================
+# 3. TRAINING
+# ============================
 
-def plot_curves(train_losses: List[float], val_losses: List[float], val_accs: List[float]):
-    os.makedirs(LOGS_DIR, exist_ok=True)
+def train_model():
+    build_segmented_dataset()
 
-    # Loss curve
+    datagen = ImageDataGenerator(
+        rescale=1./255,
+        validation_split=0.2,
+        rotation_range=15,
+        zoom_range=0.1,
+        horizontal_flip=True
+    )
+
+    train_gen = datagen.flow_from_directory(
+        DATASET_SEG,
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=BATCH_SIZE,
+        class_mode="categorical",
+        subset="training"
+    )
+
+    val_gen = datagen.flow_from_directory(
+        DATASET_SEG,
+        target_size=(IMG_SIZE, IMG_SIZE),
+        batch_size=BATCH_SIZE,
+        class_mode="categorical",
+        subset="validation"
+    )
+
+    num_classes = len(train_gen.class_indices)
+
+    # Save class index map
+    with open(CLASS_MAP_PATH, "w", encoding="utf-8") as f:
+        json.dump(train_gen.class_indices, f, ensure_ascii=False, indent=2)
+
+    model = build_cnn(num_classes)
+
+    history = model.fit(
+        train_gen,
+        epochs=EPOCHS,
+        validation_data=val_gen
+    )
+
+    model.save(MODEL_PATH)
+    print("✅ Model saved at", MODEL_PATH)
+
+    # Plot Loss + Accuracy
     plt.figure(figsize=(8, 5))
-    plt.plot(train_losses, label="Train Loss")
-    plt.plot(val_losses, label="Val Loss")
-    plt.title("Training & Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.plot(history.history["loss"], label="train")
+    plt.plot(history.history["val_loss"], label="val")
+    plt.title("Loss Curve")
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(LOGS_DIR, "training_loss.png"))
-    plt.close()
+    plt.savefig("logs/training_loss.png")
 
-    # Accuracy curve
     plt.figure(figsize=(8, 5))
-    plt.plot(val_accs, label="Val Accuracy")
-    plt.title("Validation Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy (%)")
+    plt.plot(history.history["accuracy"], label="train")
+    plt.plot(history.history["val_accuracy"], label="val")
+    plt.title("Accuracy Curve")
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(LOGS_DIR, "training_accuracy.png"))
-    plt.close()
+    plt.savefig("logs/training_accuracy.png")
 
-    # For compatibility with the original requirement name
-    # we also save a merged placeholder
-    plt.figure(figsize=(8, 5))
-    plt.plot(val_accs, label="Val Accuracy")
-    plt.title("Training Overview (Val Acc)")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy (%)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("training_plot.png")
-    plt.close()
+    print("✅ Training plots saved.")
 
-def main():
-    print("🔧 Loading config...")
-    cfg = load_config(CONFIG_PATH)
-    ensure_dirs()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Device: {device}")
-
-    print("📦 Creating dataloaders...")
-    train_loader, val_loader, class_to_idx = create_dataloaders(cfg)
-
-    with open(os.path.join(MODEL_DIR, "class_indices.json"), "w", encoding="utf-8") as f:
-        # Save both directions
-        idx_to_class = {v: k for k, v in class_to_idx.items()}
-        json.dump({
-            "class_to_idx": class_to_idx,
-            "idx_to_class": {str(k): v for k, v in idx_to_class.items()}
-        }, f, ensure_ascii=False, indent=2)
-
-    print("🧠 Building model...")
-    num_classes = cfg["dataset"]["num_classes"]
-    model = build_model(num_classes).to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=cfg["train"]["lr"])
-
-    best_acc = 0.0
-    early = EarlyStopping(patience=cfg["train"]["early_stopping_patience"], mode="max")
-
-    train_losses, val_losses, val_accs = [], [], []
-
-    print("🏁 Training start...")
-    for epoch in range(cfg["train"]["epochs"]):
-        model.train()
-        running_loss = 0.0
-
-        for imgs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['train']['epochs']}"):
-            imgs, labels = imgs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(imgs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-
-        train_loss = running_loss / max(1, len(train_loader))
-
-        # Validation
-        model.eval()
-        val_running_loss = 0.0
-        correct, total = 0, 0
-        with torch.no_grad():
-            for imgs, labels in val_loader:
-                imgs, labels = imgs.to(device), labels.to(device)
-                outputs = model(imgs)
-                loss = criterion(outputs, labels)
-                val_running_loss += loss.item()
-
-                preds = outputs.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-
-        val_loss = val_running_loss / max(1, len(val_loader))
-        val_acc = 100.0 * correct / max(1, total)
-
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_accs.append(val_acc)
-
-        print(f"📊 Epoch {epoch+1}: Train {train_loss:.4f} | Val {val_loss:.4f} | Val Acc {val_acc:.2f}%")
-
-        # Save best
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "cake_recognizer.pth"))
-            print("💾 Saving best model...")
-
-        # Early stopping
-        early.step(val_acc)
-        if early.should_stop:
-            print("⏹ Early stopping triggered.")
-            break
-
-    print("🖼 Plotting curves...")
-    plot_curves(train_losses, val_losses, val_accs)
-
-    print("✅ Training done. Best Val Acc: {:.2f}%".format(best_acc))
 
 if __name__ == "__main__":
-    main()
+    train_model()
