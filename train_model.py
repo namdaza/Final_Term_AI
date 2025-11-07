@@ -1,190 +1,204 @@
 import os
 import cv2
-import numpy as np
 import json
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import h5py
+import numpy as np
+from tqdm import tqdm
 
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, datasets
 
-# ============================
+
+# ======================
 # CONFIG
-# ============================
+# ======================
+DATASET_DIR = "dataset"              # train / valid / test nằm ở đây
+DATASET_SEG = "dataset_segmented"    # output segmentation
 
-DATASET_RAW = "dataset_raw"      # chứa ảnh chưa segmentation
-DATASET_SEG = "dataset_segmented"  # chứa ảnh sau segmentation
-MODEL_PATH = "model/model.h5"
-CLASS_MAP_PATH = "model/class_map.json"
+MODEL_DIR = "model"
+MODEL_PTH = os.path.join(MODEL_DIR, "model.pth")
+MODEL_H5 = os.path.join(MODEL_DIR, "model.h5")
+CLASS_MAP_PATH = os.path.join(MODEL_DIR, "class_map.json")
 
 IMG_SIZE = 128
+EPOCHS = 15
 BATCH_SIZE = 16
-EPOCHS = 20
+LR = 0.0005
 
 
-# ============================
-# 1. SEGMENTATION BẰNG OPENCV
-# ============================
+# ======================
+# UTILS
+# ======================
+def ensure_dirs():
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(DATASET_SEG, exist_ok=True)
 
-def segment_image(image_path):
-    img = cv2.imread(image_path)
 
+# ======================
+# SEGMENTATION
+# ======================
+
+def segment_image(path):
+    img = cv2.imread(path)
     if img is None:
         return None
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Threshold tách vật thể
-    _, th = cv2.threshold(blur, 0, 255,
-                          cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, th = cv2.threshold(
+        blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
 
-    # Morphology
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=3)
 
-    # Find contours
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
     if len(contours) == 0:
         return None
 
-    # Chọn contour lớn nhất → món bánh chính
     c = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(c)
 
     crop = img[y:y+h, x:x+w]
-    return crop
+    return cv2.resize(crop, (IMG_SIZE, IMG_SIZE))
 
 
 def build_segmented_dataset():
-    print("🔧 Creating segmented dataset...")
+    ensure_dirs()
 
-    if not os.path.exists(DATASET_SEG):
-        os.makedirs(DATASET_SEG)
+    print("🔧 Running segmentation on dataset...")
 
-    for class_name in os.listdir(DATASET_RAW):
-        class_dir_raw = os.path.join(DATASET_RAW, class_name)
-        class_dir_seg = os.path.join(DATASET_SEG, class_name)
-        os.makedirs(class_dir_seg, exist_ok=True)
+    for split in ["train", "valid", "test"]:
+        raw_split_dir = os.path.join(DATASET_DIR, split)
+        seg_split_dir = os.path.join(DATASET_SEG, split)
 
-        for file in os.listdir(class_dir_raw):
-            path = os.path.join(class_dir_raw, file)
+        if not os.path.exists(raw_split_dir):
+            continue
 
-            try:
-                cropped = segment_image(path)
-                if cropped is None:
-                    continue
+        os.makedirs(seg_split_dir, exist_ok=True)
 
-                cropped = cv2.resize(cropped, (IMG_SIZE, IMG_SIZE))
-                cv2.imwrite(os.path.join(class_dir_seg, file), cropped)
-            except:
+        for cls in os.listdir(raw_split_dir):
+            raw_cls_dir = os.path.join(raw_split_dir, cls)
+            seg_cls_dir = os.path.join(seg_split_dir, cls)
+
+            if not os.path.isdir(raw_cls_dir):
                 continue
 
-    print("✅ Segmentation done.")
+            os.makedirs(seg_cls_dir, exist_ok=True)
+
+            for file in os.listdir(raw_cls_dir):
+                img_path = os.path.join(raw_cls_dir, file)
+
+                try:
+                    crop = segment_image(img_path)
+                    if crop is not None:
+                        cv2.imwrite(os.path.join(seg_cls_dir, file), crop)
+                except:
+                    continue
+
+    print("✅ Segmentation done!")
 
 
-# ============================
-# 2. CNN MODEL (TRAIN TỪ ĐẦU)
-# ============================
+# ======================
+# CNN MODEL (PyTorch)
+# ======================
 
-def build_cnn(num_classes):
-    model = models.Sequential([
-        layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        )
 
-        layers.Conv2D(32, (3, 3), activation='relu', padding="same"),
-        layers.MaxPooling2D(),
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 16 * 16, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
 
-        layers.Conv2D(64, (3, 3), activation='relu', padding="same"),
-        layers.MaxPooling2D(),
-
-        layers.Conv2D(128, (3, 3), activation='relu', padding="same"),
-        layers.MaxPooling2D(),
-
-        layers.Flatten(),
-        layers.Dense(256, activation='relu'),
-        layers.Dropout(0.3),
-
-        layers.Dense(num_classes, activation="softmax")
-    ])
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"]
-    )
-
-    return model
+    def forward(self, x):
+        x = self.features(x)
+        return self.classifier(x)
 
 
-# ============================
-# 3. TRAINING
-# ============================
+# ======================
+# TRAINING
+# ======================
 
 def train_model():
     build_segmented_dataset()
 
-    datagen = ImageDataGenerator(
-        rescale=1./255,
-        validation_split=0.2,
-        rotation_range=15,
-        zoom_range=0.1,
-        horizontal_flip=True
-    )
+    tfms = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor()
+    ])
 
-    train_gen = datagen.flow_from_directory(
-        DATASET_SEG,
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode="categorical",
-        subset="training"
-    )
+    # Load train/valid
+    train_ds = datasets.ImageFolder(os.path.join(DATASET_SEG, "train"), transform=tfms)
+    valid_ds = datasets.ImageFolder(os.path.join(DATASET_SEG, "valid"), transform=tfms)
 
-    val_gen = datagen.flow_from_directory(
-        DATASET_SEG,
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode="categorical",
-        subset="validation"
-    )
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    num_classes = len(train_gen.class_indices)
+    num_classes = len(train_ds.class_to_idx)
 
-    # Save class index map
+    # Save class map
     with open(CLASS_MAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(train_gen.class_indices, f, ensure_ascii=False, indent=2)
+        json.dump(train_ds.class_to_idx, f, ensure_ascii=False, indent=2)
 
-    model = build_cnn(num_classes)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SimpleCNN(num_classes).to(device)
 
-    history = model.fit(
-        train_gen,
-        epochs=EPOCHS,
-        validation_data=val_gen
-    )
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    model.save(MODEL_PATH)
-    print("✅ Model saved at", MODEL_PATH)
+    print("🚀 Training CNN from scratch...")
 
-    # Plot Loss + Accuracy
-    plt.figure(figsize=(8, 5))
-    plt.plot(history.history["loss"], label="train")
-    plt.plot(history.history["val_loss"], label="val")
-    plt.title("Loss Curve")
-    plt.legend()
-    plt.savefig("logs/training_loss.png")
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
 
-    plt.figure(figsize=(8, 5))
-    plt.plot(history.history["accuracy"], label="train")
-    plt.plot(history.history["val_accuracy"], label="val")
-    plt.title("Accuracy Curve")
-    plt.legend()
-    plt.savefig("logs/training_accuracy.png")
+        for imgs, labels in tqdm(train_loader):
+            imgs, labels = imgs.to(device), labels.to(device)
 
-    print("✅ Training plots saved.")
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{EPOCHS} - Train Loss: {total_loss/len(train_loader):.4f}")
+
+    print("✅ Training complete!")
+
+    torch.save(model.state_dict(), MODEL_PTH)
+    print("✅ Saved PyTorch model:", MODEL_PTH)
+
+    save_h5(model)
+    print("✅ Saved H5 model:", MODEL_H5)
+
+
+# ======================
+# EXPORT H5 (Không cần TensorFlow)
+# ======================
+
+def save_h5(model):
+    """Lưu trọng số PyTorch vào file HDF5 (.h5)."""
+    with h5py.File(MODEL_H5, "w") as f:
+        for name, param in model.state_dict().items():
+            f.create_dataset(name, data=param.cpu().numpy())
 
 
 if __name__ == "__main__":
